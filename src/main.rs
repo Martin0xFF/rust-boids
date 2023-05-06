@@ -1,5 +1,5 @@
 use rand::prelude::*;
-use std::collections::VecDeque;
+use std::{collections::VecDeque, f32::consts::PI};
 
 use bevy::{
     prelude::*,
@@ -7,13 +7,13 @@ use bevy::{
     sprite::MaterialMesh2dBundle,
 };
 
-const NUM_BOIDS: usize = 100;
+const NUM_BOIDS: usize = 200;
 const BACKGROUND_COLOR: Color = Color::rgb(0.0, 0.0, 0.0);
 const BOID_COLOR: Color = Color::rgb(0.7, 0.0, 0.7);
 const BOID_SIZE: Vec3 = Vec3::new(10.0, 10.0, 0.0);
 const BOID_STARTING_POSITION: Vec3 = Vec3::new(0., 0., 1.0);
-const BOID_SPEED: f32 = 400.0;
-const TIME_STEP: f32 = 1.0 / 60.0;
+const BOID_SPEED: f32 = 200.0;
+const TIME_STEP: f32 = 1.0 / 600.0;
 
 const INITIAL_BALL_DIRECTION: Vec2 = Vec2::new(0.5, -0.5);
 
@@ -58,7 +58,7 @@ fn main() {
             (
                 boid_logic,
                 check_for_collisions,
-                apply_velocity.after(check_for_collisions),
+                apply_velocity.before(check_for_collisions),
             )
                 .in_schedule(CoreSchedule::FixedUpdate),
         )
@@ -66,7 +66,6 @@ fn main() {
         .insert_resource(FixedTime::new_from_secs(TIME_STEP))
         .add_system(bevy::window::close_on_esc)
         .run();
-    println!("Hello, world!");
 }
 
 fn setup(
@@ -83,6 +82,9 @@ fn setup(
         let mut boid_start_pos = BOID_STARTING_POSITION;
         let rand_x: f32 = rng.gen();
         let rand_y: f32 = rng.gen();
+        let rand_theta: f32 = 2. * rng.gen::<f32>() * PI;
+        let initial_direction = Vec2::new(f32::cos(rand_theta), f32::sin(rand_theta));
+
         boid_start_pos[0] += rand_x * 599. - 599.;
         boid_start_pos[1] += rand_y * 299. - 299.;
         commands.spawn((
@@ -93,7 +95,7 @@ fn setup(
                 ..default()
             },
             Boid,
-            Velocity(INITIAL_BALL_DIRECTION.normalize() * BOID_SPEED),
+            Velocity(initial_direction * BOID_SPEED),
         ));
     }
     // Walls
@@ -135,16 +137,37 @@ fn boid_logic(
     mut boid_query: Query<(&mut Velocity, &Transform), With<Boid>>,
     mut collision_events: EventWriter<CollisionEvent>,
 ) {
-    let kalign = 0.1;
-    let kspace = 1.0;
-    let vision_distance = 50.0;
+    let kalign = 10.0;
+    let kspace = 5000.0;
+    let kattr = 0.1;
+    let vision_distance = 25.0;
     let vision_fov = 90.0;
     let mut new_boid_velocities: VecDeque<Velocity> = VecDeque::new();
     // TODO(0xff): include void logic within this function
     for (boid_velocity, boid_transform) in &boid_query {
         let polar_boid = get_polar(boid_velocity);
         let mut accumative_alignment_residual = 0.0;
+        let mut accumative_alignment_x = 0.0;
+        let mut accumative_alignment_y = 0.0;
         let mut seperation_update = vec![0.0, 0.0];
+        let mut sum_x = 0.0;
+        let mut sum_y = 0.0;
+        let mut boid_in_range = 0;
+
+        // Distance to wall
+        let mut left_residual = LEFT_WALL - boid_transform.translation.x;
+        let mut right_residual = RIGHT_WALL - boid_transform.translation.x;
+
+        let top_residual = TOP_WALL - boid_transform.translation.y;
+        let bot_residual = BOTTOM_WALL - boid_transform.translation.y;
+
+        let wall_force_scale  = BOID_SPEED*0.0;
+        let left_wall_force = -wall_force_scale/(left_residual*left_residual);
+        let right_wall_force = wall_force_scale/(right_residual*right_residual);
+
+        let top_wall_force = wall_force_scale/(top_residual*top_residual);
+        let bot_wall_force =- wall_force_scale/(bot_residual*bot_residual);
+
         for (other_boid_velocity, other_boid_transform) in &boid_query {
             if within_range(
                 boid_transform,
@@ -152,38 +175,57 @@ fn boid_logic(
                 &vision_distance,
                 &vision_fov,
             ) {
+                boid_in_range += 1;
+                sum_x += other_boid_transform.translation.x;
+                sum_y += other_boid_transform.translation.y;
+
                 let other_polar_boid = get_polar(other_boid_velocity);
 
                 // Alignment
-                let residual_theta = other_polar_boid[1] - polar_boid[1];
-                accumative_alignment_residual += kalign * residual_theta;
+                let residual_align_x = other_boid_velocity.normalize().x - boid_velocity.normalize().x;
+                let residual_align_y = other_boid_velocity.normalize().y - boid_velocity.normalize().y;
+
+                accumative_alignment_x += kalign * residual_align_x;
+                accumative_alignment_y += kalign * residual_align_y;
 
                 // Seperation
-                let repulsion_angle = -boid_transform
-                    .translation
-                    .angle_between(other_boid_transform.translation);
+                let repulsion_direction = (other_boid_transform.translation -  boid_transform.translation).normalize();
                 let repulsion_strength = 1.0
                     / boid_transform
                         .translation
                         .distance_squared(other_boid_transform.translation);
-                let temp = vec![kspace * repulsion_strength, repulsion_angle];
-                let sep_vector = get_carte(&temp);
-                seperation_update[0] += sep_vector[0];
-                seperation_update[1] += sep_vector[1];
+                seperation_update[0] -= kspace*repulsion_strength*repulsion_direction.x;
+                seperation_update[1] -= kspace*repulsion_strength*repulsion_direction.y;
             }
         }
 
+
         // Alignment
-        let new_polar = vec![polar_boid[0], polar_boid[1] + accumative_alignment_residual];
-        let mut new_boid_velocity = get_carte(&new_polar);
+        // let new_polar = vec![polar_boid[0], polar_boid[1] + accumative_alignment_residual];
+        // let mut new_boid_velocity = get_carte(&new_polar);
+        let mut new_boid_velocity = Vec2::new(accumative_alignment_x + boid_velocity.x, accumative_alignment_y + boid_velocity.y);
 
         // Seperation
         new_boid_velocity[0] += seperation_update[0];
         new_boid_velocity[1] += seperation_update[1];
 
+        // Center Seeking
+        if (boid_in_range >0){
+            let avg_boid_x = sum_x/boid_in_range as f32;
+            let avg_boid_y = sum_y/boid_in_range as f32;
+            let avg_vec = Vec3 { x: avg_boid_x, y: avg_boid_y, z: 1. };
+            let attraction_direction =   -(boid_transform.translation - avg_vec).normalize();
+            let attraction_strength = boid_transform.translation.distance_squared(avg_vec);
+            new_boid_velocity[0]+= kattr*attraction_strength*attraction_direction[0];
+            new_boid_velocity[1]+= kattr*attraction_strength*attraction_direction[1];
+        }
+
+        new_boid_velocity[0] -= left_wall_force + right_wall_force;
+        new_boid_velocity[1] -= top_wall_force + bot_wall_force;
+
         let new_speed = new_boid_velocity
             .distance(Vec2 { x: 0.0, y: 0.0 })
-            .clamp(0.0, BOID_SPEED);
+            .clamp(BOID_SPEED, BOID_SPEED);
         new_boid_velocities.push_back(Velocity(new_boid_velocity.normalize() * new_speed));
     }
 
@@ -196,16 +238,15 @@ fn boid_logic(
     }
 }
 fn check_for_collisions(
-    mut boid_query: Query<(&mut Velocity, &Transform), With<Boid>>,
-    collider_query: Query<(Entity, &Transform), With<Collider>>,
+    mut boid_query: Query<(&Boid, &mut Velocity, &mut Transform), Without<Collider>>,
+    collider_query: Query<(&Collider, &Transform), Without<Boid>>,
     mut collision_events: EventWriter<CollisionEvent>,
 ) {
     // TODO(0xff): include void logic within this function
-    for (mut boid_velocity, boid_transform) in &mut boid_query {
+    for (boid, mut boid_velocity, mut boid_transform) in &mut boid_query {
         let boid_size = boid_transform.scale.truncate();
-
         // check collision with walls
-        for (collider_entity, transform) in &collider_query {
+        for (collider, transform) in &collider_query {
             let collision = collide(
                 boid_transform.translation,
                 boid_size,
@@ -216,28 +257,14 @@ fn check_for_collisions(
                 // Sends a collision event so that other systems can react to the collision
                 collision_events.send_default();
 
-                // reflect the boid when it collides
-                let mut reflect_x = false;
-                let mut reflect_y = false;
-
                 // only reflect if the boid's velocity is going in the opposite direction of the
                 // collision
                 match collision {
-                    Collision::Left => reflect_x = boid_velocity.x > 0.0,
-                    Collision::Right => reflect_x = boid_velocity.x < 0.0,
-                    Collision::Top => reflect_y = boid_velocity.y < 0.0,
-                    Collision::Bottom => reflect_y = boid_velocity.y > 0.0,
+                    Collision::Left => boid_transform.translation.x = LEFT_WALL + 10.,
+                    Collision::Right => boid_transform.translation.x = RIGHT_WALL - 10.,
+                    Collision::Top => boid_transform.translation.y = TOP_WALL - 10.,
+                    Collision::Bottom => boid_transform.translation.y = BOTTOM_WALL + 10.,
                     Collision::Inside => { /* do nothing */ }
-                }
-
-                // reflect velocity on the x-axis if we hit something on the x-axis
-                if reflect_x {
-                    boid_velocity.x = -boid_velocity.x;
-                }
-
-                // reflect velocity on the y-axis if we hit something on the y-axis
-                if reflect_y {
-                    boid_velocity.y = -boid_velocity.y;
                 }
             }
         }
